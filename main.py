@@ -162,7 +162,7 @@ def estimate_c1_independence(
     device = next(model.parameters()).device
     ratios = {k: [] for k in k_list if k > 0}
     pool_log_rs: List[float] = []
-
+    print(f"[Step 1] Estimating independence ratios for task {task.name}, blind={blind}...")
     results = {}
     for ki in k_list:
         if ki == 0:
