@@ -575,10 +575,10 @@ if __name__ == "__main__":
 
         # ---- Step 1: Assumption 2 独立性 c1 估计（含 log_r 样本池）
         c1_stats_blind, c1_pool = estimate_c1_independence(
-            trec, phi_star, model, tok, trials=100, blind=True, return_pool=True
+            trec, phi_star, model, tok, trials=100, blind=True
         )
         c1_stats, _ = estimate_c1_independence(
-            trec, phi_star, model, tok, trials=100, blind=False, return_pool=True
+            trec, phi_star, model, tok, trials=100, blind=False
         )
         print(f"[Step 1] independence ratio stats: {c1_stats}; if blind instr: {c1_stats_blind}")
 
