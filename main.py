@@ -479,11 +479,11 @@ def run_theorem1_experiment(
 def prepare_downstream_tasks(trec):
     tasks = []
     tasks.append(trec.build_binary_subtask("HUM", "LOC"))
-    tasks.append(trec.build_binary_subtask("NUM", "DESC"))
-    tasks.append(trec.build_binary_subtask("HUM", "ENTY"))
+    # tasks.append(trec.build_binary_subtask("NUM", "DESC"))
+    # tasks.append(trec.build_binary_subtask("HUM", "ENTY"))
     tasks.append(trec.build_binary_subtask("HUM", "NUM"))
-    tasks.append(trec.build_binary_subtask("DESC", "NUM"))
-    tasks.append(trec.build_binary_subtask("ABBR", "ENTY"))
+    tasks.append(trec.build_binary_subtask("LOC", "NUM"))
+    # tasks.append(trec.build_binary_subtask("ABBR", "ENTY"))
     return tasks
 
 
