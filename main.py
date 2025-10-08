@@ -11,8 +11,8 @@ import torch
 import wandb
 
 STYLE = "qa"  # ["instruction", "qa", "minimal"]
-# K_LIST = tuple(list(range(0, 5)) + list(range(6, 17, 4)))  # k values to test
-K_LIST = (0, 1, 2)
+K_LIST = tuple(list(range(0, 5)) + list(range(6, 17, 4)))  # k values to test
+# K_LIST = (0, 1, 2)
 EPSILON = 1e-2  # concentration threshold
 device = "cuda" if torch.cuda.is_available() else "cpu"
 add_random_sep = True
