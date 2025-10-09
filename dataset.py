@@ -76,7 +76,11 @@ class TrecICLDataset:
         cls1 = [p for p in pairs if p[1] == 1]
         k1 = k_total // 2
         k0 = k_total - k1
-        if len(cls0) < k0 or len(cls1) < k1:
+        if k_total == 1:
+            return [self.rng.choice(pairs)]
+        elif k_total == 0:
+            return []
+        elif len(cls0) < k0 or len(cls1) < k1:
             raise ValueError("Try select more samples.")
         out = self.rng.sample(cls0, k0) + self.rng.sample(cls1, k1)
         self.rng.shuffle(out)

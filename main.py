@@ -12,6 +12,7 @@ import wandb
 
 STYLE = "qa"  # ["instruction", "qa", "minimal"]
 K_LIST = tuple(list(range(0, 5)) + list(range(6, 17, 4)))  # k values to test
+FLIP = 0.5
 # K_LIST = (0, 1, 2)
 EPSILON = 1e-2  # concentration threshold
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -26,7 +27,7 @@ config = {
     "epsilon": EPSILON,
     "add_random_sep": add_random_sep
 }
-wandb.init(project="icl", name="run1", config=config)
+wandb.init(project="icl", name=f"{STYLE}_{FLIP}", config=config)
 
 def to_device(model) -> torch.device:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -36,13 +37,12 @@ def to_device(model) -> torch.device:
 
 
 def text_logprob(model, tok, text: str, device='cuda') -> float:
-    """整段文本的对数似然 log P(text)。"""
     with torch.no_grad():
         enc = tok(
             text,
             return_tensors="pt",
             truncation=True,
-            max_length=model.config.max_position_embeddings,  # 通常4096
+            max_length=model.config.max_position_embeddings,
         )
         input_ids = enc.input_ids.to(device)
         attn = enc.attention_mask.to(device)
@@ -124,43 +124,6 @@ def make_trec_prompt(
         raise ValueError(f"Unknown style: {style}")
 
 
-def test_trec(
-    trec,
-    model,
-    tok,
-    max_eval=None,
-    k_list=(0, 8, 16, 64),
-    flip_prob=0,
-    device='cuda'
-) -> Dict[int, float]:
-    task = trec.get_original_task()
-    if 0 not in k_list:
-        k_list = (0,) + tuple(k_list)
-    correct = [0 for _ in k_list]
-    total = [0 for _ in k_list]
-    if max_eval is not None:
-        original = trec.sample_k_for_task(task, k_total=max_eval, flip_prob=flip_prob)
-    else:
-        original = trec.get_original_dataset()
-
-    for i, k in tqdm(enumerate(k_list), total=len(k_list), desc="Evaluating TREC"):
-        print(f"  k = {k}")
-        for (text, _lid, name) in original:
-            prefix = task.instr_blind + "\n\n"
-            if k > 0:
-                support = trec.sample_k_for_task(task, k_total=k, flip_prob=flip_prob)
-                for (sq, _sy, slab) in support:
-                    prefix += make_trec_prompt(sq, label_name=slab, style=STYLE, include_label=True)
-            prefix += make_trec_prompt(text, label_name=None, style=STYLE, include_label=False)
-            scores = []
-            for cname in trec.verbalizers.values():
-                lp, _ = label_conditional_logprob(model, tok, prefix, cname.lower(), device)
-                scores.append((lp, cname))
-            pred = max(scores, key=lambda x: x[0])[1]
-            if pred == name:
-                correct[i] += 1
-            total[i] += 1
-    return {k: c / t if t > 0 else 0 for c, t, k in zip(correct, total, k_list)}
 
 
 # -----------------------------------------------------------
@@ -195,8 +158,8 @@ def estimate_c1_independence(
             continue
         for _ in range(trials):
             # === 构造 s1, s2 ===
-            samp1 = trec.sample_k_for_task(task, k_total=ki)
-            samp2 = trec.sample_k_for_task(task, k_total=ki)
+            samp1 = trec.sample_k_for_task(task, k_total=ki, flip_prob=FLIP)
+            samp2 = trec.sample_k_for_task(task, k_total=ki, flip_prob=FLIP)
             s1 = (task.instr_blind if blind else task.instr) + "\n\n"
             for ex in samp1:
                 q, y = ex[0], ex[1]
@@ -239,9 +202,9 @@ def estimate_c1_independence(
         }
         print(f"k={ki:<3d} mean_log_r={mean_log_r:8.2f}  per_token={mean_log_r_token:8.4f}")
         wandb.log({
+            "k": int(ki),
             f"c1/{task.name}":
                 {
-                    "k": int(ki),
                     "mean": float(mean_log_r),
                     "per_token": float(mean_log_r_token),
                     "min": float(min(ratios[ki])),
@@ -297,28 +260,7 @@ def kshot_prompt_label_score(
     return total_lp, total_tokens, prefix
 
 
-# def estimate_c2_prompt_likelihood(
-#     trec,
-#     phi_star,
-#     model,
-#     tok,
-#     k_list=(1, 2, 8, 16, 64),
-#     R=50,
-# ):
-#     results = {}
-#     pool = []
-#     for k in k_list:
-#         logprobs = []
-#         for _ in range(R):
-#             samp = trec.sample_k_for_task(phi_star, k_total=k)
-#             lp, _ = kshot_prompt_label_score(model, tok, phi_star, samp)
-#             logprobs.append(lp)
-#         pool += logprobs
-#         mean_lp = sum(logprobs) / len(logprobs)
-#         std_lp = (sum((x - mean_lp) ** 2 for x in logprobs) / len(logprobs)) ** 0.5
-#         results[k] = {"mean_lp": float(mean_lp), "std_lp": float(std_lp), "all": [float(v) for v in logprobs]}
-#         print(f"[Step 2] k={k:2d} | mean label logprob sum: {mean_lp:.2f} ± {std_lp:.2f}")
-#     return results, pool
+
 
 def estimate_c2_prompt_likelihood(
     trec,
@@ -340,7 +282,7 @@ def estimate_c2_prompt_likelihood(
     for k in k_list:
         logprobs, logprobs_per_token = [], []
         for _ in range(R):
-            samp = trec.sample_k_for_task(phi_star, k_total=k+1)
+            samp = trec.sample_k_for_task(phi_star, k_total=k+1, flip_prob=FLIP)
             lp, _, prefix = kshot_prompt_label_score(model, tok, phi_star, samp)
             # 计算 prompt 长度（token 数）
             n_tokens = len(tok(prefix, truncation=True, max_length=4096).input_ids)
@@ -369,13 +311,13 @@ def estimate_c2_prompt_likelihood(
         print(f"[Step 2] k={k:2d} | mean logP(p): {mean_lp:9.2f} ± {std_lp:6.2f} "
               f"| per-token: {mean_lp_token:8.4f} ± {std_lp_token:6.4f}")
         wandb.log({
+            "k": int(k),
             f"c2/{phi_star.name}":
                 {
                     "mean_log_p": float(mean_lp),
                     "std_log_p": float(std_lp),
                     "mean_log_p_per_token": float(mean_lp_token),
                     "std_log_p_per_token": float(std_lp_token),
-                    "k": int(k),
                 }
         })
     mean_lp_global = sum(pool_raw) / len(pool_raw)
@@ -401,38 +343,55 @@ def run_concentration_experiment(
     tok,
     k_list,
     R: int = 100,
-    epsilon: float = 1e-2,
-    flip_prob: float = 0.0,
+    epsilon: float = 1e-2
 ) -> Dict[int, float]:
     results = {}
     log_eps = math.log(epsilon)
     if 0 not in k_list:
         k_list = (0,) + tuple(k_list)
+    
+    kl_stats = []  # ⬅️ 保存 KL 散度
+
     for k in k_list:
         success = 0
+        kl_vals = []
         for _ in range(R):
-            samp = trec.sample_k_for_task(phi_star_task, k_total=k+1, flip_prob=flip_prob)
+            samp = trec.sample_k_for_task(phi_star_task, k_total=k+1, flip_prob=FLIP)
             lp_star, _, _ = kshot_prompt_label_score(model, tok, phi_star_task, samp)
             ok_all = True
             for phi in candidate_tasks:
                 if phi.name == phi_star_task.name:
                     continue
                 lp_phi, _, _ = kshot_prompt_label_score(model, tok, phi, samp)
+
+                # ---- KL divergence term ----
+                kl_val = lp_star - lp_phi
+                kl_vals.append(kl_val)
+
+                # ---- Lemma 1 success condition ----
                 if (lp_phi - lp_star) >= log_eps:
                     ok_all = False
                     break
             if ok_all:
                 success += 1
-        results[k] = success / R
-        wandb.log(
-            {
-                f"lemma1_concentration/{phi_star_task.name}": {
-                    "k": int(k),
-                    "concentration_prob": float(results[k]),
-                }
-                    
+        prob = success / R
+        results[k] = {"concentration_prob": prob}
+        if kl_vals:
+            mean_kl = sum(kl_vals) / len(kl_vals)
+            results[k]["kl_mean"] = mean_kl
+            results[k]["kl_min"] = min(kl_vals)
+            results[k]["kl_max"] = max(kl_vals)
+            kl_stats.append(mean_kl)
+
+        wandb.log({
+            "k": int(k),
+            f"lemma1_concentration/{phi_star_task.name}": {
+                "concentration_prob": float(prob),
+                "mean_KL": float(mean_kl)
             }
-        )
+        })
+        print(f"[Step 2] k={k:2d} | concentration_prob: {prob:.3f} | mean_KL: {mean_kl:.2f}")
+
     return results
 
 
@@ -494,7 +453,7 @@ def probe_task_identification(
         X, y = [], []
         for cls, task in enumerate(candidate_tasks):
             for _ in range(per_task_prompts):
-                exs = trec.sample_k_for_task(task, k_total=k+1)
+                exs = trec.sample_k_for_task(task, k_total=k+1, flip_prob=FLIP)
                 prefix = task.instr_blind + '\n\n'
                 for i, (text, _, label) in enumerate(exs):
                     if i == len(exs) - 1:
@@ -559,16 +518,16 @@ def probe_task_identification(
             
             
         wandb.log({
-            f"probe/{task.name}": {
-                "k": int(k),
+            "k": int(k),
+            f"probe": {
                 "probe_acc": float(acc),
             }
         })
         ret[k]["probe_acc"] = acc
         print(f"[Step 2] k={k} probe_acc: {acc:.4f}")
         wandb.log({
-            f"probe/{task.name}": {
-                "k": int(k),
+            "k": int(k),
+            f"probe": {
                 "fisher_ratio": float(fr),
             }
         })
@@ -624,7 +583,7 @@ def run_theorem1_experiment(
     theta = log_c1 + log_c2
 
     # 准备测试样本：仅保留 Δ0>0
-    ds = trec.sample_k_for_task(phi_task, k_total=max_tests * 2)
+    ds = trec.sample_k_for_task(phi_task, k_total=max_tests * 2, flip_prob=FLIP)
     tests = []
     for (q, yid, y_true) in ds:
         y_alt = phi_task.verbalizers[1 - yid]
@@ -644,7 +603,7 @@ def run_theorem1_experiment(
         for (q, y_true, y_alt, d0) in tests:
             ok = 0
             for _ in range(R):
-                exs = trec.sample_k_for_task(phi_task, k_total=k)
+                exs = trec.sample_k_for_task(phi_task, k_total=k, flip_prob=FLIP)
                 dk = kshot_margin(model, tok, phi_task, q, y_true, y_alt, exs, device)
                 if dk > (d0 / 2.0 + theta):
                     ok += 1
@@ -653,8 +612,8 @@ def run_theorem1_experiment(
         per_k_success[k] = succ_cnt / max(tot, 1)
         print(f"[Theorem1] k={k:2d} | succ@per-x>=0.5 = {per_k_success[k]:.3f}  (theta={theta:.2f})")
         wandb.log({
+            "k": int(k),
             f"theorem1/{phi_task.name}": {
-                "k": int(k),
                 "success_prob": float(per_k_success[k]),
             }
         })
@@ -861,7 +820,7 @@ if __name__ == "__main__":
         candidates = [t for t in tasks if t is not phi_star]
         curve = run_concentration_experiment(
             trec, phi_star, candidates, model, tok,
-            k_list=K_LIST, R=100, epsilon=EPSILON, flip_prob=0.0
+            k_list=K_LIST, R=100, epsilon=EPSILON
         )
         print(f"[Step 3] success probability curve (epsilon={EPSILON}):", curve)
 
@@ -890,7 +849,7 @@ if __name__ == "__main__":
                 "note": "values are stats over log-ratios; mean_ratio_exp is for display only"
             },
             "assumption3_label_lp": c2_stats,
-            "lemma1_concentration": {int(k): float(v) for k, v in curve.items()},
+            "lemma1_concentration": curve,
             "probe": probes,
             "theorem1": theorem1
         }
