@@ -1,20 +1,20 @@
 from dataset import TrecICLDataset
-from typing import List, Dict, Iterable, Optional, Tuple
+from typing import List, Dict, Optional
 import math
 import random
-import json
-import numpy as np
-import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import wandb
+import json, os
+import matplotlib.pyplot as plt
+import numpy as np
 
 STYLE = "qa"  # ["instruction", "qa", "minimal"]
-K_LIST = tuple(list(range(0, 5)) + list(range(6, 17, 4)))  # k values to test
-FLIP = 0.5
-# K_LIST = (0, 1, 2)
+K_LIST = tuple(list(range(0, 5)) + list(range(6, 16, 4)))  # k values to test
+FLIP = 0
 EPSILON = 1e-2  # concentration threshold
+DELTA = 1e-2  # margin success threshold
 device = "cuda" if torch.cuda.is_available() else "cpu"
 add_random_sep = True
 print("Using prompt style:", STYLE)
@@ -27,7 +27,7 @@ config = {
     "epsilon": EPSILON,
     "add_random_sep": add_random_sep
 }
-wandb.init(project="icl", name=f"{STYLE}_{FLIP}", config=config)
+wandb.init(project="icl", name=f"{STYLE}_{FLIP}_{EPSILON}_{DELTA}", config=config)
 
 def to_device(model) -> torch.device:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,7 +80,6 @@ def label_conditional_logprob(
 import random, string
 
 def random_sep(length=4):
-    """生成一个随机的分隔符，例如 '### SEP_XQZT ###'"""
     tag = "".join(random.choices(string.ascii_uppercase, k=length))
     return f"\n### SEP_{tag} ###\n"
 
@@ -90,9 +89,8 @@ def make_trec_prompt(
     label_name=None,
     style="qa",          # ["instruction", "qa", "minimal"]
     include_label=True,
-    add_random_sep=add_random_sep  # 是否添加随机分隔符，
+    add_random_sep=add_random_sep 
 ) -> str:
-    """构造 TREC few-shot 示例的 prompt。"""
     sep = random_sep() if add_random_sep else "\n"
     prefix = ""
 
@@ -126,9 +124,6 @@ def make_trec_prompt(
 
 
 
-# -----------------------------------------------------------
-# 1) Assumption 2：独立性下界 c1 的经验估计（返回统计 + 全部 log_r 池）
-# -----------------------------------------------------------
 
 def estimate_c1_independence(
     trec,
@@ -139,12 +134,6 @@ def estimate_c1_independence(
     trials=100,
     blind=False,
 ) -> Dict[int, Dict[str, float]]:
-    """
-    估计 Assumption 2 的独立性常数 c1。
-    输出:
-      results[k] = 各 k 的 log 比例统计（含 per-token 归一化）
-      global_stats = {"mean_log_c1_fixed_k1": ..., "mean_log_c1_per_token": ...}
-    """
     device = next(model.parameters()).device
     ratios = {k: [] for k in k_list if k > 0}
     ratios_per_token = {k: [] for k in k_list if k > 0}
@@ -157,7 +146,6 @@ def estimate_c1_independence(
         if ki == 0:
             continue
         for _ in range(trials):
-            # === 构造 s1, s2 ===
             samp1 = trec.sample_k_for_task(task, k_total=ki, flip_prob=FLIP)
             samp2 = trec.sample_k_for_task(task, k_total=ki, flip_prob=FLIP)
             s1 = (task.instr_blind if blind else task.instr) + "\n\n"
@@ -171,26 +159,22 @@ def estimate_c1_independence(
                 lab = ex[2] if len(ex) == 3 else task.verbalizers[y]
                 s2 += make_trec_prompt(q, label_name=lab, style=STYLE, include_label=True)
 
-            # === Compute log probabilities ===
             lp_s1n = text_logprob(model, tok, s1 + "\n", device)
             lp_s2 = text_logprob(model, tok, s2, device)
             lp_s1s2 = text_logprob(model, tok, s1 + "\n" + s2, device)
 
-            # === Compute token lengths ===
             def tok_len(text):
                 ids = tok(text, truncation=True, max_length=4096)["input_ids"]
                 return len(ids) if isinstance(ids[0], int) else len(ids[0])
 
             len1, len2, len12 = tok_len(s1 + "\n"), tok_len(s2), tok_len(s1 + "\n" + s2)
 
-            # === Per-token normalized log ratio ===
             log_r = lp_s1n + lp_s2 - lp_s1s2
             log_r_norm = (lp_s1n / len1) + (lp_s2 / len2) - (lp_s1s2 / len12)
             pool_log_rs.append(log_r_norm)
             ratios[ki].append(log_r)
             ratios_per_token[ki].append(log_r_norm)
 
-        # === 每个 k 的统计 ===
         mean_log_r = sum(ratios[ki]) / len(ratios[ki])
         mean_log_r_token = sum(ratios_per_token[ki]) / len(ratios_per_token[ki])
         results[ki] = {
@@ -212,7 +196,6 @@ def estimate_c1_independence(
                     "mean_exp": float(math.exp(max(min(mean_log_r, 0), -50))),
                 }
         })
-    # === 计算全局 fixed-c1（取 k=1） ===
     if 1 in ratios:
         mean_log_c1_fixed = sum(ratios[1]) / len(ratios[1])
     else:
@@ -233,9 +216,6 @@ def estimate_c1_independence(
         f"c1/{task.name}/global": global_stats
     })
     return {"per_k": results, "global": global_stats, "pool": pool_log_rs}
-# -----------------------------------------------------------
-# 2) 估计某个 k-shot prompt 的‘可能性’（标签条件 logprob 总和）
-# -----------------------------------------------------------
 
 def kshot_prompt_label_score(
     model,
@@ -252,7 +232,6 @@ def kshot_prompt_label_score(
             q, y = ex
             lab = task.verbalizers[y]
         if i == len(examples) - 1:
-            # 最后一个不包含标签
             lab = None
         pfx = make_trec_prompt(q, label_name=lab, style=STYLE, include_label=True)
         prefix += pfx
@@ -270,10 +249,7 @@ def estimate_c2_prompt_likelihood(
     k_list,
     R=50,
 ):
-    """
-    估计 Assumption 3 中的 c2 —— 每个 prompt 的 log-likelihood 下界。
-    输出包含 per-token 归一化版本，以消除长度偏差。
-    """
+
     results = {}
     pool_raw = []
     pool_per_token = []
@@ -284,7 +260,6 @@ def estimate_c2_prompt_likelihood(
         for _ in range(R):
             samp = trec.sample_k_for_task(phi_star, k_total=k+1, flip_prob=FLIP)
             lp, _, prefix = kshot_prompt_label_score(model, tok, phi_star, samp)
-            # 计算 prompt 长度（token 数）
             n_tokens = len(tok(prefix, truncation=True, max_length=4096).input_ids)
             lp_per_token = lp / max(n_tokens, 1)
 
@@ -331,9 +306,6 @@ def estimate_c2_prompt_likelihood(
 
     return {"per_k": results, "global": global_stats, "pool": pool_raw}
 
-# -----------------------------------------------------------
-# 3) Lemma 1：随 k 增大，错误任务 φ 的相对概率 Pφ(p)/Pφ*(p) 收敛到 < ε
-# -----------------------------------------------------------
 
 def run_concentration_experiment(
     trec,
@@ -350,7 +322,7 @@ def run_concentration_experiment(
     if 0 not in k_list:
         k_list = (0,) + tuple(k_list)
     
-    kl_stats = []  # ⬅️ 保存 KL 散度
+    kl_stats = [] 
 
     for k in k_list:
         success = 0
@@ -395,9 +367,6 @@ def run_concentration_experiment(
     return results
 
 
-# -----------------------------------------------------------
-# Probe：φ(context) 线性可分性（用于 Theorem 1 旁证）
-# -----------------------------------------------------------
 
 def extract_phi_context(
     model,
@@ -414,7 +383,7 @@ def extract_phi_context(
             prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=model.config.max_position_embeddings,  # 通常4096
+            max_length=model.config.max_position_embeddings,  # 4096
         )
         input_ids = enc.input_ids.to(device)
         attn = enc.attention_mask.to(device)
@@ -465,7 +434,6 @@ def probe_task_identification(
         X = np.asarray(X)
         y = np.asarray(y)
 
-        # 划分训练/测试
         n = len(X)
         idx = list(range(n))
         rng.shuffle(idx)
@@ -474,7 +442,6 @@ def probe_task_identification(
         Xtr, Ytr = X[tr_idx], y[tr_idx]
         Xte, Yte = X[te_idx], y[te_idx]
 
-        # 线性 probe
         try:
             from sklearn.linear_model import LogisticRegression
             clf = LogisticRegression(max_iter=2000, solver="lbfgs", penalty="l2", C=0.1, n_jobs=1)
@@ -484,14 +451,7 @@ def probe_task_identification(
         except Exception as e:
             print(e)
             acc = float("nan")
-            # # 退化版
-            # Xtr_ = torch.from_numpy(Xtr)
-            # Ytr_ = torch.from_numpy(Ytr)
-            # C = int(y.max() + 1)
-            # Ytr_oh = torch.nn.functional.one_hot(Ytr_, num_classes=C).float()
-            # W, _ = torch.linalg.lstsq(Ytr_oh, torch.cat([Xtr_, torch.ones(len(Xtr_), 1)], dim=1))
-            # logits = Xte @ W[:Xtr_.shape[1]].numpy().T
-            # acc = float((logits.argmax(1) == Yte).mean())
+
             
 
         
@@ -524,7 +484,7 @@ def probe_task_identification(
             }
         })
         ret[k]["probe_acc"] = acc
-        print(f"[Step 2] k={k} probe_acc: {acc:.4f}")
+        print(f"[Step 0] k={k} probe_acc: {acc:.4f}")
         wandb.log({
             "k": int(k),
             f"probe": {
@@ -532,15 +492,8 @@ def probe_task_identification(
             }
         })
         ret[k]["fisher_ratio"] = fr
-        print(f"[Step 2] k={k} fisher_ratio: {fr:.4f}")
+        print(f"[Step 0] k={k} fisher_ratio: {fr:.4f}")
     return ret
-
-
-# -----------------------------------------------------------
-# Theorem 1：margin 提升不等式的经验验证
-#   Δ0(x;y,ŷ) = log P(y|x) - log P(ŷ|x)
-#   Δk(p,x;y,ŷ) > Δ0/2 + (log c1 + log c2)
-# -----------------------------------------------------------
 
 
 
@@ -559,11 +512,6 @@ def kshot_margin(model, tok, phi_task, question: str, y: str, y_tilde: str, ksho
 
 
 
-
-
-
-
-
 def run_theorem1_experiment(
     trec,
     phi_task,
@@ -574,15 +522,16 @@ def run_theorem1_experiment(
     k_list,
     R=50,
     max_tests=100,
+    delta=1e-2,
     device=None,
 ) -> Dict[str, object]:
     if device is None:
         device = next(model.parameters()).device
-    log_c1 = c1_stats["global"]["mean_log_c1_per_token"]
-    log_c2 = c2_stats["global"]["mean_log_c2_per_token"]
-    theta = log_c1 + log_c2
 
-    # 准备测试样本：仅保留 Δ0>0
+    log_c1_per_tok = c1_stats["global"]["mean_log_c1_per_token"]
+    log_c2_per_tok = c2_stats["global"]["mean_log_c2_per_token"]
+
+    # Δ0>0 selection
     ds = trec.sample_k_for_task(phi_task, k_total=max_tests * 2, flip_prob=FLIP)
     tests = []
     for (q, yid, y_true) in ds:
@@ -593,38 +542,68 @@ def run_theorem1_experiment(
         if len(tests) >= max_tests:
             break
     print(f"[Step 2] selected {len(tests)} tests with Δ0 > 0")
+
     per_k_success = {}
-    if 0 not in k_list:        
+    if 0 not in k_list:
         k_list = (0,) + tuple(k_list)
 
     for k in k_list:
         succ_cnt = 0
         tot = 0
+
         for (q, y_true, y_alt, d0) in tests:
             ok = 0
             for _ in range(R):
+                # sample k-shot examples
                 exs = trec.sample_k_for_task(phi_task, k_total=k, flip_prob=FLIP)
+
+                # construct full prompt and compute token length
+                prefix = phi_task.instr_blind + '\n\n'
+                for i, (text, _, label) in enumerate(exs):
+                    if i == len(exs) - 1:
+                        label = None
+                    prefix += make_trec_prompt(text, label_name=label, style=STYLE, include_label=True)
+
+                # count total tokens in this prompt
+                with torch.no_grad():
+                    L = len(tok(prefix, truncation=True, max_length=4096)["input_ids"])
+
+                # total-scale constants for this prompt
+                theta = L * 2 * log_c1_per_tok
+
+                # compute contextual margin
                 dk = kshot_margin(model, tok, phi_task, q, y_true, y_alt, exs, device)
+
                 if dk > (d0 / 2.0 + theta):
                     ok += 1
-            succ_cnt += (ok / R) >= 0.5
+
+            succ_cnt += (ok / R) >= 1-delta
             tot += 1
+
         per_k_success[k] = succ_cnt / max(tot, 1)
-        print(f"[Theorem1] k={k:2d} | succ@per-x>=0.5 = {per_k_success[k]:.3f}  (theta={theta:.2f})")
+        print(f"[Theorem1] k={k:2d} | succ@per-x>={1-delta} = {per_k_success[k]:.3f} (mean L≈{L}, θ={theta:.2f})")
+
         wandb.log({
             "k": int(k),
             f"theorem1/{phi_task.name}": {
                 "success_prob": float(per_k_success[k]),
+                "mean_L": float(L),
+                "theta": float(theta)
             }
         })
+
     wandb.log({
         f"theorem1/{phi_task.name}": {
-            "theta": float(theta),
-            "log_c1_hat": float(log_c1),
-            "log_c2_hat": float(log_c2),
+            "log_c1_hat": float(log_c1_per_tok),
+            "log_c2_hat": float(log_c2_per_tok),
         }
     })
-    return {"theta": float(theta), "log_c1_hat": float(log_c1), "log_c2_hat": float(log_c2), "per_k_success": {int(k): float(v) for k, v in per_k_success.items()}}
+
+    return {
+        "log_c1_hat": float(log_c1_per_tok),
+        "log_c2_hat": float(log_c2_per_tok),
+        "per_k_success": {int(k): float(v) for k, v in per_k_success.items()},
+    }
 
 
 def prepare_downstream_tasks(trec):
@@ -638,155 +617,13 @@ def prepare_downstream_tasks(trec):
     return tasks
 
 
-import json
-import math
-import matplotlib.pyplot as plt
-import os
 
-import json, os
-import matplotlib.pyplot as plt
-import numpy as np
-
-def plot_from_json(json_path: str, save_dir: str = "."):
-    """从保存的 results_xxx.json 文件中读取并绘制 4 张对比图。"""
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    phi_name = data["task"]
-    model_name = data["model"]
-    EPSILON = data.get("epsilon", 5e-2)
-    K_LIST = data.get("k_list", [])
-    theorem1 = data["theorem1"]
-    probes = data["probe"]
-    lemma1 = data["lemma1_concentration"]
-    assumption2 = data["assumption2"]
-    assumption3 = data.get("assumption3_label_lp", {})
-
-    xs = np.array(sorted([int(k) for k in K_LIST]))
-    ys_conc = np.array([lemma1.get(str(k), lemma1.get(k, 0.0)) for k in xs])
-    ys_probe = np.array([probes[k]["probe_acc"] if k < len(probes) else np.nan for k in xs])
-    theo_map = theorem1.get("per_k_success", {})
-    ys_theo = np.array([theo_map.get(str(k), theo_map.get(int(k), 0.0)) for k in xs])
-    ys_margin = ys_theo  # margin success probability ~ theorem1
-
-    # --- per-token c1/c2 ---
-    c1_token = []
-    if "blind" in assumption2:
-        for k in xs:
-            entry = assumption2["blind"].get(str(k)) or assumption2["blind"].get(k)
-            if entry and "mean_log_ratio_per_token" in entry:
-                c1_token.append(entry["mean_log_ratio_per_token"])
-            elif entry and "mean_log_ratio" in entry:
-                c1_token.append(entry["mean_log_ratio"])
-            else:
-                c1_token.append(np.nan)
-    c2_token = []
-    if isinstance(assumption3, dict):
-        for k in xs:
-            entry = assumption3.get(str(k)) or assumption3.get(k)
-            if entry and "mean_lp_per_token" in entry:
-                c2_token.append(entry["mean_lp_per_token"])
-            elif entry and "mean_lp" in entry:
-                c2_token.append(entry["mean_lp"])
-            else:
-                c2_token.append(np.nan)
-
-    c1_token, c2_token = np.array(c1_token), np.array(c2_token)
-
-    # ======================================================
-    # 1️⃣ 图1: c1/c2 per-token vs k (左轴) + concentration/probe (右轴)
-    # ======================================================
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(xs, c1_token, "o-", label="log c1/token", color="tab:blue")
-    ax1.plot(xs, c2_token, "^-", label="log c2/token", color="tab:orange")
-    ax1.set_xlabel("k (shots)")
-    ax1.set_ylabel("Per-token log c₁ / c₂")
-    ax1.grid(True, linestyle="--", alpha=0.5)
-    ax2 = ax1.twinx()
-    ax2.plot(xs, ys_conc, "s--", label="Concentration (Lemma 1)", color="tab:green")
-    ax2.plot(xs, ys_probe, "x--", label="Probe Acc", color="tab:red")
-    ax2.set_ylabel("Concentration / Probe Acc")
-    ax2.set_ylim(0, 1)
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines + lines2, labels + labels2, loc="upper right")
-    plt.title(f"({phi_name}) Per-token c₁,c₂ vs Concentration/Probe")
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{phi_name}_plot1_c1c2_conc_probe.png"), dpi=300)
-    plt.close()
-
-    # ======================================================
-    # 2️⃣ 图2: c1/c2 per-token vs k (左轴) + margin success (右轴)
-    # ======================================================
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(xs, c1_token, "o-", label="log c1/token", color="tab:blue")
-    ax1.plot(xs, c2_token, "^-", label="log c2/token", color="tab:orange")
-    ax2 = ax1.twinx()
-    ax2.plot(xs, ys_margin, "s--", color="tab:purple", label="Margin Success (Theorem 1)")
-    ax1.set_xlabel("k (shots)")
-    ax1.set_ylabel("Per-token log c₁ / c₂")
-    ax2.set_ylabel("Margin Success Prob.")
-    ax2.set_ylim(0, 1)
-    ax1.grid(True, linestyle="--", alpha=0.5)
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines + lines2, labels + labels2, loc="upper right")
-    plt.title(f"({phi_name}) Per-token c₁,c₂ vs Margin Success")
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{phi_name}_plot2_c1c2_margin.png"), dpi=300)
-    plt.close()
-
-    # ======================================================
-    # 3️⃣ 图3: x=c1, 左轴=margin，右轴=concentration/probe
-    # ======================================================
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(c1_token, ys_margin, "o-", color="tab:purple", label="Margin Success")
-    ax1.set_xlabel("Per-token log c₁")
-    ax1.set_ylabel("Margin Success Prob.", color="tab:purple")
-    ax2 = ax1.twinx()
-    ax2.plot(c1_token, ys_conc, "s--", color="tab:green", label="Concentration")
-    ax2.plot(c1_token, ys_probe, "x--", color="tab:red", label="Probe Acc")
-    ax2.set_ylabel("Concentration / Probe Acc", color="tab:red")
-    ax2.set_ylim(0, 1)
-    ax1.grid(True, linestyle="--", alpha=0.5)
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines + lines2, labels + labels2, loc="upper right")
-    plt.title(f"({phi_name}) Margin vs c₁ Relation")
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{phi_name}_plot3_margin_c1.png"), dpi=300)
-    plt.close()
-
-    # ======================================================
-    # 4️⃣ 图4: x=c2, 左轴=margin，右轴=concentration/probe
-    # ======================================================
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(c2_token, ys_margin, "o-", color="tab:purple", label="Margin Success")
-    ax1.set_xlabel("Per-token log c₂")
-    ax1.set_ylabel("Margin Success Prob.", color="tab:purple")
-    ax2 = ax1.twinx()
-    ax2.plot(c2_token, ys_conc, "s--", color="tab:green", label="Concentration")
-    ax2.plot(c2_token, ys_probe, "x--", color="tab:red", label="Probe Acc")
-    ax2.set_ylabel("Concentration / Probe Acc", color="tab:red")
-    ax2.set_ylim(0, 1)
-    ax1.grid(True, linestyle="--", alpha=0.5)
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines + lines2, labels + labels2, loc="upper right")
-    plt.title(f"({phi_name}) Margin vs c₂ Relation")
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{phi_name}_plot4_margin_c2.png"), dpi=300)
-    plt.close()
-
-    print(f"[✓] All plots for {phi_name} saved to {save_dir}")
     
 if __name__ == "__main__":
     trec = TrecICLDataset(split="train", seed=42)
 
-    # 选择模型名称
     model_name = "microsoft/Phi-3-mini-4k-instruct"
     print("Using model:", model_name)
-    # 加载 tokenizer 与模型
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -798,25 +635,23 @@ if __name__ == "__main__":
 
     tasks = prepare_downstream_tasks(trec)
     print("\nPrepared downstream tasks:", [t.name for t in tasks])
-    # ---- Probe（φ 识别能力）
+    
     probes = probe_task_identification(trec, model, tok, tasks, k_list=K_LIST)
     print(probes)
+    
     for phi_star in tasks:
         print(f"\n=== Analyzing task φ* = {phi_star.name} ===")
 
-        # ---- Step 1: Assumption 2 独立性 c1 估计（含 log_r 样本池）
         c1_stats_blind = estimate_c1_independence(
-            trec, phi_star, model, tok, k_list=[k for k in K_LIST if k > 0], trials=100, blind=True
+            trec, phi_star, model, tok, k_list=[k for k in K_LIST if k > 0], trials=50, blind=True
         )
         # c1_stats = estimate_c1_independence(
         #     trec, phi_star, model, tok, trials=100, blind=False
         # )
         print(f"[Step 1] independence ratio stats if blind instr: {c1_stats_blind}")
 
-        # ---- Step 2: 估计某个 k-shot prompt 的‘可能性’（标签条件 logprob/每 token）
         c2_stats = estimate_c2_prompt_likelihood(trec, phi_star, model, tok, k_list=K_LIST, R=50)
 
-        # ---- Step 3: Lemma 1 – Pφ(p)/Pφ*(p) < ε 的经验概率随 k 增长
         candidates = [t for t in tasks if t is not phi_star]
         curve = run_concentration_experiment(
             trec, phi_star, candidates, model, tok,
@@ -826,27 +661,25 @@ if __name__ == "__main__":
 
 
 
-        # ---- Theorem 1：margin 不等式实验
         theorem1 = run_theorem1_experiment(
             trec, phi_star, model, tok, c1_stats_blind, c2_stats,
             k_list=[k for k in K_LIST if k > 0],
-            R=40, max_tests=80,
+            R=50, max_tests=80, delta=DELTA,
             device=device
         )
 
         
 
-        # ---- 保存 JSON：包含 Assump2/3, Lemma1, Probe, Theorem1 全部数据
         out = {
             "task": phi_star.name,
             "model": model_name,
             "style": STYLE,
             "epsilon": EPSILON,
+            "delta": DELTA,
             "k_list": list(map(int, K_LIST)),
             "assumption2": {
                 # "with_instr": c1_stats,
                 "blind": c1_stats_blind,
-                "note": "values are stats over log-ratios; mean_ratio_exp is for display only"
             },
             "assumption3_label_lp": c2_stats,
             "lemma1_concentration": curve,
@@ -858,8 +691,3 @@ if __name__ == "__main__":
             json.dump(out, f, ensure_ascii=False, indent=2)
         print(f"[JSON] saved: {json_name}")
         
-        # ---- 绘图：Lemma1（concentration）+ Probe + Theorem1（margin succ）
-        try:
-            plot_from_json(f"results_{phi_star.name}.json", save_dir=".")
-        except Exception as e:
-            print("Plot skipped:", e)
