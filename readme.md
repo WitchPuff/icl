@@ -1,4 +1,4 @@
-# In-Context Learning Theorem 1 Experiments
+# Empirical Analysis of PAC Learnability in In-Context Learning
 
 This repository implements empirical experiments for validating **Lemma 1** and **Theorem 1** from  
 *“The Learnability of In-Context Learning”* (Wies et al., 2024).  
