@@ -3,6 +3,7 @@
 This repository implements empirical experiments for validating **Lemma 1** and **Theorem 1** from  
 *“The Learnability of In-Context Learning”* (Wies et al., 2024).  
 
+[Report](https://github.com/WitchPuff/icl/blob/main/report.pdf)
 
 ---
 
@@ -14,6 +15,7 @@ This repository implements empirical experiments for validating **Lemma 1** and 
 | **`main.py`** | Main experiment script. Runs evaluation with different prompt types, random label flips, and concentration thresholds. |
 | **`qa_0_1e-2/`** | Results using QA-style prompts with **no random label flipping**. Concentration threshold `ε = 1e-2`, margin success threshold `δ = 1e-2`. |
 | **`qa_0.5_1e-2/`** | Results using QA-style prompts with **0.5 probability random label flipping**. Same thresholds `ε = 1e-2`, `δ = 1e-2`. |
+| report.pdf | The report of this project. |
 
 ---
 
